@@ -9,6 +9,39 @@
     app_dir: "/var/www/travelmemory"
 
   tasks:
+    # 1. SETUP SWAP SPACE (Fixes OOM rc: -9)
+    - name: Check if swapfile exists
+      stat:
+        path: /swapfile
+      register: swap_file_check
+
+    - name: Create 2GB swap file
+      command: dd if=/dev/zero of=/swapfile bs=1M count=2048
+      when: not swap_file_check.stat.exists
+
+    - name: Set permissions on swap file
+      file:
+        path: /swapfile
+        mode: '0600'
+      when: not swap_file_check.stat.exists
+
+    - name: Format swap file
+      command: mkswap /swapfile
+      when: not swap_file_check.stat.exists
+
+    - name: Enable swap
+      command: swapon /swapfile
+      when: not swap_file_check.stat.exists
+
+    - name: Ensure swap is enabled at boot
+      mount:
+        name: none
+        src: /swapfile
+        fstype: swap
+        opts: sw
+        state: present
+
+    # 2. RUNTIME AND DEPENDENCIES
     - name: Install Git, Node.js, and build tools
       dnf:
         name:
@@ -28,17 +61,16 @@
         state: directory
         owner: ec2-user
         group: ec2-user
-        mode: "0755"
+        mode: '0755'
 
     - name: Clone TravelMemory repository
       git:
         repo: "{{ repo_url }}"
         dest: "{{ app_dir }}"
-        version: master
+        version: main
         force: yes
       become_user: ec2-user
 
-    # BACKEND SETUP
     - name: Install backend dependencies
       npm:
         path: "{{ app_dir }}/backend"
@@ -52,36 +84,60 @@
         content: |
           PORT={{ backend_port }}
           MONGO_URI=mongodb://{{ mongodb_host_ip }}:27017/travelmemory
+          CORS_ORIGIN=*
 
-    # FRONTEND SETUP & IN-PLACE PATCHING
+    # 3. FRONTEND INSTALLATION WITH MEMORY LIMIT
     - name: Install frontend dependencies
-      npm:
-        path: "{{ app_dir }}/frontend"
+      command: npm install --legacy-peer-deps
+      args:
+        chdir: "{{ app_dir }}/frontend"
+      environment:
+        NODE_OPTIONS: "--max-old-space-size=1536"
       become_user: ec2-user
 
     - name: Patch url.js with public backend IP
       lineinfile:
         path: "{{ app_dir }}/frontend/src/url.js"
-        regexp: "^export const baseUrl ="
+        regexp: '^export const baseUrl ='
         line: 'export const baseUrl = "http://{{ backend_host_ip }}:{{ backend_port }}";'
         owner: ec2-user
         group: ec2-user
+    
+    # 4. PROCESS MANAGEMENT (IDEMPOTENT)
+    - name: Check PM2 running processes
+      command: pm2 list
+      register: pm2_list
+      changed_when: false
+      become_user: ec2-user
 
-    # PROCESS EXECUTION
-    - name: Start backend via PM2
-      command: pm2 start index.js --name "travelmemory-backend"
+    # BACKEND
+    - name: Start backend via PM2 (if not already started)
+      command: pm2 start index.js --name "travelmemory-backend" --update-env
       args:
         chdir: "{{ app_dir }}/backend"
       environment:
         NODE_ENV: production
+      when: "'travelmemory-backend' not in pm2_list.stdout"
       become_user: ec2-user
 
-    - name: Start frontend via PM2
+    - name: Restart backend via PM2 (if already running)
+      command: pm2 restart travelmemory-backend --update-env
+      when: "'travelmemory-backend' in pm2_list.stdout"
+      become_user: ec2-user
+
+    # FRONTEND
+    - name: Start frontend via PM2 (if not already started)
       command: pm2 start npm --name "travelmemory-frontend" -- start
       args:
         chdir: "{{ app_dir }}/frontend"
       environment:
         PORT: "{{ frontend_port }}"
+      when: "'travelmemory-frontend' not in pm2_list.stdout"
+      become_user: ec2-user
+
+    - name: Restart frontend via PM2 (if already running)
+      command: pm2 restart travelmemory-frontend --update-env
+      when: "'travelmemory-frontend' in pm2_list.stdout"
       become_user: ec2-user
 
     - name: Save PM2 process list
