@@ -1,0 +1,42 @@
+---
+- hosts: database
+  become: yes
+  tasks:
+    - name: Install Docker
+      dnf:
+        name: docker
+        state: present
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ec2-user to docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: yes
+
+    - name: Create persistent directory for MongoDB data
+      file:
+        path: /var/lib/mongo_data
+        state: directory
+        owner: 999 # Standard mongodb container user ID
+        group: 999
+        mode: "0755"
+
+    - name: Run MongoDB container
+      command: >
+        docker run -d
+        --name mongodb
+        --restart unless-stopped
+        -p 27017:27017
+        -v /var/lib/mongo_data:/data/db
+        mongo:7.0
+      register: docker_run_result
+      failed_when:
+        - docker_run_result.rc != 0
+        - "'Conflict' not in docker_run_result.stderr"
+      changed_when: docker_run_result.rc == 0

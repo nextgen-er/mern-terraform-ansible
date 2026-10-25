@@ -1,0 +1,89 @@
+---
+- hosts: web
+  become: yes
+  vars_files:
+    - env.yml
+
+  vars:
+    repo_url: "https://github.com/UnpredictablePrashant/TravelMemory.git"
+    app_dir: "/var/www/travelmemory"
+
+  tasks:
+    - name: Install Git, Node.js, and build tools
+      dnf:
+        name:
+          - git
+          - nodejs
+          - npm
+        state: present
+
+    - name: Install PM2 process manager
+      npm:
+        name: pm2
+        global: yes
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+        mode: "0755"
+
+    - name: Clone TravelMemory repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: master
+        force: yes
+      become_user: ec2-user
+
+    # BACKEND SETUP
+    - name: Install backend dependencies
+      npm:
+        path: "{{ app_dir }}/backend"
+      become_user: ec2-user
+
+    - name: Configure Backend .env file
+      copy:
+        dest: "{{ app_dir }}/backend/.env"
+        owner: ec2-user
+        group: ec2-user
+        content: |
+          PORT={{ backend_port }}
+          MONGO_URI=mongodb://{{ mongodb_host_ip }}:27017/travelmemory
+
+    # FRONTEND SETUP & IN-PLACE PATCHING
+    - name: Install frontend dependencies
+      npm:
+        path: "{{ app_dir }}/frontend"
+      become_user: ec2-user
+
+    - name: Patch url.js with public backend IP
+      lineinfile:
+        path: "{{ app_dir }}/frontend/src/url.js"
+        regexp: "^export const baseUrl ="
+        line: 'export const baseUrl = "http://{{ backend_host_ip }}:{{ backend_port }}";'
+        owner: ec2-user
+        group: ec2-user
+
+    # PROCESS EXECUTION
+    - name: Start backend via PM2
+      command: pm2 start index.js --name "travelmemory-backend"
+      args:
+        chdir: "{{ app_dir }}/backend"
+      environment:
+        NODE_ENV: production
+      become_user: ec2-user
+
+    - name: Start frontend via PM2
+      command: pm2 start npm --name "travelmemory-frontend" -- start
+      args:
+        chdir: "{{ app_dir }}/frontend"
+      environment:
+        PORT: "{{ frontend_port }}"
+      become_user: ec2-user
+
+    - name: Save PM2 process list
+      command: pm2 save
+      become_user: ec2-user
